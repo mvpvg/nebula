@@ -18,35 +18,38 @@ type ConnectionState struct {
 	eKey           *NebulaCipherState
 	dKey           *NebulaCipherState
 	H              *noise.HandshakeState
-	certState      *CertState
-	peerCert       *cert.NebulaCertificate
+	myCert         cert.Certificate
+	peerCert       *cert.CachedCertificate
 	initiator      bool
 	messageCounter atomic.Uint64
 	window         *Bits
-	queueLock      sync.Mutex
 	writeLock      sync.Mutex
-	ready          bool
 }
 
-func (f *Interface) newConnectionState(l *logrus.Logger, initiator bool, pattern noise.HandshakePattern, psk []byte, pskStage int) *ConnectionState {
+func NewConnectionState(l *logrus.Logger, cipher string, certState *CertState, initiator bool, pattern noise.HandshakePattern, psk []byte, pskStage int) *ConnectionState {
 	var dhFunc noise.DHFunc
-	curCertState := f.certState.Load()
-
-	switch curCertState.certificate.Details.Curve {
+	switch certState.Certificate.Curve() {
 	case cert.Curve_CURVE25519:
 		dhFunc = noise.DH25519
 	case cert.Curve_P256:
-		dhFunc = noiseutil.DHP256
+		if certState.pkcs11Backed {
+			dhFunc = noiseutil.DHP256PKCS11
+		} else {
+			dhFunc = noiseutil.DHP256
+		}
 	default:
-		l.Errorf("invalid curve: %s", curCertState.certificate.Details.Curve)
+		l.Errorf("invalid curve: %s", certState.Certificate.Curve())
 		return nil
 	}
-	cs := noise.NewCipherSuite(dhFunc, noiseutil.CipherAESGCM, noise.HashSHA256)
-	if f.cipher == "chachapoly" {
+
+	var cs noise.CipherSuite
+	if cipher == "chachapoly" {
 		cs = noise.NewCipherSuite(dhFunc, noise.CipherChaChaPoly, noise.HashSHA256)
+	} else {
+		cs = noise.NewCipherSuite(dhFunc, noiseutil.CipherAESGCM, noise.HashSHA256)
 	}
 
-	static := noise.DHKey{Private: curCertState.privateKey, Public: curCertState.publicKey}
+	static := noise.DHKey{Private: certState.PrivateKey, Public: certState.PublicKey}
 
 	b := NewBits(ReplayWindow)
 	// Clear out bit 0, we never transmit it and we don't want it showing as packet loss
@@ -71,9 +74,10 @@ func (f *Interface) newConnectionState(l *logrus.Logger, initiator bool, pattern
 		H:         hs,
 		initiator: initiator,
 		window:    b,
-		ready:     false,
-		certState: curCertState,
+		myCert:    certState.Certificate,
 	}
+	// always start the counter from 2, as packet 1 and packet 2 are handshake packets.
+	ci.messageCounter.Add(2)
 
 	return ci
 }
@@ -83,6 +87,5 @@ func (cs *ConnectionState) MarshalJSON() ([]byte, error) {
 		"certificate":     cs.peerCert,
 		"initiator":       cs.initiator,
 		"message_counter": cs.messageCounter.Load(),
-		"ready":           cs.ready,
 	})
 }

@@ -9,16 +9,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
+	"github.com/gaissmai/bart"
 	"github.com/sirupsen/logrus"
-	"github.com/slackhq/nebula/cidr"
-	"github.com/slackhq/nebula/iputil"
+	"github.com/slackhq/nebula/config"
+	"github.com/slackhq/nebula/util"
 )
 
 const (
@@ -45,10 +47,10 @@ type ifreqDestroy struct {
 
 type tun struct {
 	Device    string
-	cidr      *net.IPNet
+	cidr      netip.Prefix
 	MTU       int
-	Routes    []Route
-	routeTree *cidr.Tree4
+	Routes    atomic.Pointer[[]Route]
+	routeTree atomic.Pointer[bart.Table[netip.Addr]]
 	l         *logrus.Logger
 
 	io.ReadWriteCloser
@@ -76,14 +78,15 @@ func (t *tun) Close() error {
 	return nil
 }
 
-func newTunFromFd(_ *logrus.Logger, _ int, _ *net.IPNet, _ int, _ []Route, _ int, _ bool) (*tun, error) {
+func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ netip.Prefix) (*tun, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in FreeBSD")
 }
 
-func newTun(l *logrus.Logger, deviceName string, cidr *net.IPNet, defaultMTU int, routes []Route, _ int, _ bool, _ bool) (*tun, error) {
+func newTun(c *config.C, l *logrus.Logger, cidr netip.Prefix, _ bool) (*tun, error) {
 	// Try to open existing tun device
 	var file *os.File
 	var err error
+	deviceName := c.GetString("tun.dev", "")
 	if deviceName != "" {
 		file, err = os.OpenFile("/dev/"+deviceName, os.O_RDWR, 0)
 	}
@@ -144,63 +147,97 @@ func newTun(l *logrus.Logger, deviceName string, cidr *net.IPNet, defaultMTU int
 		ioctl(fd, syscall.SIOCSIFNAME, uintptr(unsafe.Pointer(&ifrr)))
 	}
 
-	routeTree, err := makeRouteTree(l, routes, false)
+	t := &tun{
+		ReadWriteCloser: file,
+		Device:          deviceName,
+		cidr:            cidr,
+		MTU:             c.GetInt("tun.mtu", DefaultMTU),
+		l:               l,
+	}
+
+	err = t.reload(c, true)
 	if err != nil {
 		return nil, err
 	}
 
-	return &tun{
-		ReadWriteCloser: file,
-		Device:          deviceName,
-		cidr:            cidr,
-		MTU:             defaultMTU,
-		Routes:          routes,
-		routeTree:       routeTree,
-		l:               l,
-	}, nil
+	c.RegisterReloadCallback(func(c *config.C) {
+		err := t.reload(c, false)
+		if err != nil {
+			util.LogWithContextIfNeeded("failed to reload tun device", err, t.l)
+		}
+	})
+
+	return t, nil
 }
 
 func (t *tun) Activate() error {
 	var err error
 	// TODO use syscalls instead of exec.Command
-	t.l.Debug("command: ifconfig", t.Device, t.cidr.String(), t.cidr.IP.String())
-	if err = exec.Command("/sbin/ifconfig", t.Device, t.cidr.String(), t.cidr.IP.String()).Run(); err != nil {
+	cmd := exec.Command("/sbin/ifconfig", t.Device, t.cidr.String(), t.cidr.Addr().String())
+	t.l.Debug("command: ", cmd.String())
+	if err = cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run 'ifconfig': %s", err)
 	}
-	t.l.Debug("command: route", "-n", "add", "-net", t.cidr.String(), "-interface", t.Device)
-	if err = exec.Command("/sbin/route", "-n", "add", "-net", t.cidr.String(), "-interface", t.Device).Run(); err != nil {
+
+	cmd = exec.Command("/sbin/route", "-n", "add", "-net", t.cidr.String(), "-interface", t.Device)
+	t.l.Debug("command: ", cmd.String())
+	if err = cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run 'route add': %s", err)
 	}
-	t.l.Debug("command: ifconfig", t.Device, "mtu", strconv.Itoa(t.MTU))
-	if err = exec.Command("/sbin/ifconfig", t.Device, "mtu", strconv.Itoa(t.MTU)).Run(); err != nil {
+
+	cmd = exec.Command("/sbin/ifconfig", t.Device, "mtu", strconv.Itoa(t.MTU))
+	t.l.Debug("command: ", cmd.String())
+	if err = cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run 'ifconfig': %s", err)
 	}
+
 	// Unsafe path routes
-	for _, r := range t.Routes {
-		if r.Via == nil || !r.Install {
-			// We don't allow route MTUs so only install routes with a via
-			continue
+	return t.addRoutes(false)
+}
+
+func (t *tun) reload(c *config.C, initial bool) error {
+	change, routes, err := getAllRoutesFromConfig(c, t.cidr, initial)
+	if err != nil {
+		return err
+	}
+
+	if !initial && !change {
+		return nil
+	}
+
+	routeTree, err := makeRouteTree(t.l, routes, false)
+	if err != nil {
+		return err
+	}
+
+	// Teach nebula how to handle the routes before establishing them in the system table
+	oldRoutes := t.Routes.Swap(&routes)
+	t.routeTree.Store(routeTree)
+
+	if !initial {
+		// Remove first, if the system removes a wanted route hopefully it will be re-added next
+		err := t.removeRoutes(findRemovedRoutes(routes, *oldRoutes))
+		if err != nil {
+			util.LogWithContextIfNeeded("Failed to remove routes", err, t.l)
 		}
 
-		t.l.Debug("command: route", "-n", "add", "-net", r.Cidr.String(), "-interface", t.Device)
-		if err = exec.Command("/sbin/route", "-n", "add", "-net", r.Cidr.String(), "-interface", t.Device).Run(); err != nil {
-			return fmt.Errorf("failed to run 'route add' for unsafe_route %s: %s", r.Cidr.String(), err)
+		// Ensure any routes we actually want are installed
+		err = t.addRoutes(true)
+		if err != nil {
+			// Catch any stray logs
+			util.LogWithContextIfNeeded("Failed to add routes", err, t.l)
 		}
 	}
 
 	return nil
 }
 
-func (t *tun) RouteFor(ip iputil.VpnIp) iputil.VpnIp {
-	r := t.routeTree.MostSpecificContains(ip)
-	if r != nil {
-		return r.(iputil.VpnIp)
-	}
-
-	return 0
+func (t *tun) RouteFor(ip netip.Addr) netip.Addr {
+	r, _ := t.routeTree.Load().Lookup(ip)
+	return r
 }
 
-func (t *tun) Cidr() *net.IPNet {
+func (t *tun) Cidr() netip.Prefix {
 	return t.cidr
 }
 
@@ -210,6 +247,46 @@ func (t *tun) Name() string {
 
 func (t *tun) NewMultiQueueReader() (io.ReadWriteCloser, error) {
 	return nil, fmt.Errorf("TODO: multiqueue not implemented for freebsd")
+}
+
+func (t *tun) addRoutes(logErrors bool) error {
+	routes := *t.Routes.Load()
+	for _, r := range routes {
+		if !r.Via.IsValid() || !r.Install {
+			// We don't allow route MTUs so only install routes with a via
+			continue
+		}
+
+		cmd := exec.Command("/sbin/route", "-n", "add", "-net", r.Cidr.String(), "-interface", t.Device)
+		t.l.Debug("command: ", cmd.String())
+		if err := cmd.Run(); err != nil {
+			retErr := util.NewContextualError("failed to run 'route add' for unsafe_route", map[string]interface{}{"route": r}, err)
+			if logErrors {
+				retErr.Log(t.l)
+			} else {
+				return retErr
+			}
+		}
+	}
+
+	return nil
+}
+
+func (t *tun) removeRoutes(routes []Route) error {
+	for _, r := range routes {
+		if !r.Install {
+			continue
+		}
+
+		cmd := exec.Command("/sbin/route", "-n", "delete", "-net", r.Cidr.String(), "-interface", t.Device)
+		t.l.Debug("command: ", cmd.String())
+		if err := cmd.Run(); err != nil {
+			t.l.WithError(err).WithField("route", r).Error("Failed to remove route")
+		} else {
+			t.l.WithField("route", r).Info("Removed route")
+		}
+	}
+	return nil
 }
 
 func (t *tun) deviceBytes() (o [16]byte) {

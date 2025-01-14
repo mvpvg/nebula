@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -40,14 +39,14 @@ func verify(args []string, out io.Writer, errOut io.Writer) error {
 		return err
 	}
 
-	rawCACert, err := ioutil.ReadFile(*vf.caPath)
+	rawCACert, err := os.ReadFile(*vf.caPath)
 	if err != nil {
 		return fmt.Errorf("error while reading ca: %s", err)
 	}
 
 	caPool := cert.NewCAPool()
 	for {
-		rawCACert, err = caPool.AddCACertificate(rawCACert)
+		rawCACert, err = caPool.AddCAFromPEM(rawCACert)
 		if err != nil {
 			return fmt.Errorf("error while adding ca cert to pool: %s", err)
 		}
@@ -57,18 +56,18 @@ func verify(args []string, out io.Writer, errOut io.Writer) error {
 		}
 	}
 
-	rawCert, err := ioutil.ReadFile(*vf.certPath)
+	rawCert, err := os.ReadFile(*vf.certPath)
 	if err != nil {
 		return fmt.Errorf("unable to read crt; %s", err)
 	}
 
-	c, _, err := cert.UnmarshalNebulaCertificateFromPEM(rawCert)
+	c, _, err := cert.UnmarshalCertificateFromPEM(rawCert)
 	if err != nil {
 		return fmt.Errorf("error while parsing crt: %s", err)
 	}
 
-	good, err := c.Verify(time.Now(), caPool)
-	if !good {
+	_, err = caPool.VerifyCertificate(time.Now(), c)
+	if err != nil {
 		return err
 	}
 

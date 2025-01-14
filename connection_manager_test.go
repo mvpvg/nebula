@@ -4,28 +4,26 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/flynn/noise"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
 )
 
-var vpnIp iputil.VpnIp
-
 func newTestLighthouse() *LightHouse {
 	lh := &LightHouse{
-		l:       test.NewLogger(),
-		addrMap: map[iputil.VpnIp]*RemoteList{},
+		l:         test.NewLogger(),
+		addrMap:   map[netip.Addr]*RemoteList{},
+		queryChan: make(chan netip.Addr, 10),
 	}
-	lighthouses := map[iputil.VpnIp]struct{}{}
-	staticList := map[iputil.VpnIp]struct{}{}
+	lighthouses := map[netip.Addr]struct{}{}
+	staticList := map[netip.Addr]struct{}{}
 
 	lh.lighthouses.Store(&lighthouses)
 	lh.staticList.Store(&staticList)
@@ -36,18 +34,20 @@ func newTestLighthouse() *LightHouse {
 func Test_NewConnectionManagerTest(t *testing.T) {
 	l := test.NewLogger()
 	//_, tuncidr, _ := net.ParseCIDR("1.1.1.1/24")
-	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
-	vpnIp = iputil.Ip2VpnIp(net.ParseIP("172.1.1.2"))
-	preferredRanges := []*net.IPNet{localrange}
+	vpncidr := netip.MustParsePrefix("172.1.1.1/24")
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	vpnIp := netip.MustParseAddr("172.1.1.2")
+	preferredRanges := []netip.Prefix{localrange}
 
 	// Very incomplete mock objects
-	hostMap := NewHostMap(l, vpncidr, preferredRanges)
+	hostMap := newHostMap(l, vpncidr)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
 	cs := &CertState{
-		rawCertificate:      []byte{},
-		privateKey:          []byte{},
-		certificate:         &cert.NebulaCertificate{},
-		rawCertificateNoKey: []byte{},
+		RawCertificate:      []byte{},
+		PrivateKey:          []byte{},
+		Certificate:         &dummyCert{},
+		RawCertificateNoKey: []byte{},
 	}
 
 	lh := newTestLighthouse()
@@ -57,10 +57,11 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
-		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		pki:              &PKI{},
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
 		l:                l,
 	}
-	ifce.certState.Store(cs)
+	ifce.pki.cs.Store(cs)
 
 	// Create manager
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,8 +79,8 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		remoteIndexId: 9901,
 	}
 	hostinfo.ConnectionState = &ConnectionState{
-		certState: cs,
-		H:         &noise.HandshakeState{},
+		myCert: &dummyCert{},
+		H:      &noise.HandshakeState{},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
 
@@ -116,17 +117,20 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 func Test_NewConnectionManagerTest2(t *testing.T) {
 	l := test.NewLogger()
 	//_, tuncidr, _ := net.ParseCIDR("1.1.1.1/24")
-	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
-	preferredRanges := []*net.IPNet{localrange}
+	vpncidr := netip.MustParsePrefix("172.1.1.1/24")
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	vpnIp := netip.MustParseAddr("172.1.1.2")
+	preferredRanges := []netip.Prefix{localrange}
 
 	// Very incomplete mock objects
-	hostMap := NewHostMap(l, vpncidr, preferredRanges)
+	hostMap := newHostMap(l, vpncidr)
+	hostMap.preferredRanges.Store(&preferredRanges)
+
 	cs := &CertState{
-		rawCertificate:      []byte{},
-		privateKey:          []byte{},
-		certificate:         &cert.NebulaCertificate{},
-		rawCertificateNoKey: []byte{},
+		RawCertificate:      []byte{},
+		PrivateKey:          []byte{},
+		Certificate:         &dummyCert{},
+		RawCertificateNoKey: []byte{},
 	}
 
 	lh := newTestLighthouse()
@@ -136,10 +140,11 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		outside:          &udp.NoopConn{},
 		firewall:         &Firewall{},
 		lightHouse:       lh,
-		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		pki:              &PKI{},
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
 		l:                l,
 	}
-	ifce.certState.Store(cs)
+	ifce.pki.cs.Store(cs)
 
 	// Create manager
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,8 +162,8 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		remoteIndexId: 9901,
 	}
 	hostinfo.ConnectionState = &ConnectionState{
-		certState: cs,
-		H:         &noise.HandshakeState{},
+		myCert: &dummyCert{},
+		H:      &noise.HandshakeState{},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
 
@@ -200,67 +205,65 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	now := time.Now()
 	l := test.NewLogger()
-	ipNet := net.IPNet{
-		IP:   net.IPv4(172, 1, 1, 2),
-		Mask: net.IPMask{255, 255, 255, 0},
-	}
-	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
-	preferredRanges := []*net.IPNet{localrange}
-	hostMap := NewHostMap(l, vpncidr, preferredRanges)
+
+	vpncidr := netip.MustParsePrefix("172.1.1.1/24")
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	vpnIp := netip.MustParseAddr("172.1.1.2")
+	preferredRanges := []netip.Prefix{localrange}
+	hostMap := newHostMap(l, vpncidr)
+	hostMap.preferredRanges.Store(&preferredRanges)
 
 	// Generate keys for CA and peer's cert.
 	pubCA, privCA, _ := ed25519.GenerateKey(rand.Reader)
-	caCert := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:      "ca",
-			NotBefore: now,
-			NotAfter:  now.Add(1 * time.Hour),
-			IsCA:      true,
-			PublicKey: pubCA,
-		},
+	tbs := &cert.TBSCertificate{
+		Version:   1,
+		Name:      "ca",
+		IsCA:      true,
+		NotBefore: now,
+		NotAfter:  now.Add(1 * time.Hour),
+		PublicKey: pubCA,
 	}
-	caCert.Sign(cert.Curve_CURVE25519, privCA)
-	ncp := &cert.NebulaCAPool{
-		CAs: cert.NewCAPool().CAs,
-	}
-	ncp.CAs["ca"] = &caCert
+
+	caCert, err := tbs.Sign(nil, cert.Curve_CURVE25519, privCA)
+	assert.NoError(t, err)
+	ncp := cert.NewCAPool()
+	assert.NoError(t, ncp.AddCA(caCert))
 
 	pubCrt, _, _ := ed25519.GenerateKey(rand.Reader)
-	peerCert := cert.NebulaCertificate{
-		Details: cert.NebulaCertificateDetails{
-			Name:      "host",
-			Ips:       []*net.IPNet{&ipNet},
-			Subnets:   []*net.IPNet{},
-			NotBefore: now,
-			NotAfter:  now.Add(60 * time.Second),
-			PublicKey: pubCrt,
-			IsCA:      false,
-			Issuer:    "ca",
-		},
+	tbs = &cert.TBSCertificate{
+		Version:   1,
+		Name:      "host",
+		Networks:  []netip.Prefix{vpncidr},
+		NotBefore: now,
+		NotAfter:  now.Add(60 * time.Second),
+		PublicKey: pubCrt,
 	}
-	peerCert.Sign(cert.Curve_CURVE25519, privCA)
+	peerCert, err := tbs.Sign(caCert, cert.Curve_CURVE25519, privCA)
+	assert.NoError(t, err)
+
+	cachedPeerCert, err := ncp.VerifyCertificate(now.Add(time.Second), peerCert)
 
 	cs := &CertState{
-		rawCertificate:      []byte{},
-		privateKey:          []byte{},
-		certificate:         &cert.NebulaCertificate{},
-		rawCertificateNoKey: []byte{},
+		RawCertificate:      []byte{},
+		PrivateKey:          []byte{},
+		Certificate:         &dummyCert{},
+		RawCertificateNoKey: []byte{},
 	}
 
 	lh := newTestLighthouse()
 	ifce := &Interface{
-		hostMap:           hostMap,
-		inside:            &test.NoopTun{},
-		outside:           &udp.NoopConn{},
-		firewall:          &Firewall{},
-		lightHouse:        lh,
-		handshakeManager:  NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
-		l:                 l,
-		disconnectInvalid: true,
-		caPool:            ncp,
+		hostMap:          hostMap,
+		inside:           &test.NoopTun{},
+		outside:          &udp.NoopConn{},
+		firewall:         &Firewall{},
+		lightHouse:       lh,
+		handshakeManager: NewHandshakeManager(l, hostMap, lh, &udp.NoopConn{}, defaultHandshakeConfig),
+		l:                l,
+		pki:              &PKI{},
 	}
-	ifce.certState.Store(cs)
+	ifce.pki.cs.Store(cs)
+	ifce.pki.caPool.Store(ncp)
+	ifce.disconnectInvalid.Store(true)
 
 	// Create manager
 	ctx, cancel := context.WithCancel(context.Background())
@@ -272,9 +275,9 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	hostinfo := &HostInfo{
 		vpnIp: vpnIp,
 		ConnectionState: &ConnectionState{
-			certState: cs,
-			peerCert:  &peerCert,
-			H:         &noise.HandshakeState{},
+			myCert:   &dummyCert{},
+			peerCert: cachedPeerCert,
+			H:        &noise.HandshakeState{},
 		},
 	}
 	nc.hostMap.unlockedAddHostInfo(hostinfo, ifce)
@@ -292,4 +295,115 @@ func Test_NewConnectionManagerTest_DisconnectInvalid(t *testing.T) {
 	nextTick = now.Add(61 * time.Second)
 	invalid = nc.isInvalidCertificate(nextTick, hostinfo)
 	assert.True(t, invalid)
+}
+
+type dummyCert struct {
+	version        cert.Version
+	curve          cert.Curve
+	groups         []string
+	isCa           bool
+	issuer         string
+	name           string
+	networks       []netip.Prefix
+	notAfter       time.Time
+	notBefore      time.Time
+	publicKey      []byte
+	signature      []byte
+	unsafeNetworks []netip.Prefix
+}
+
+func (d *dummyCert) Version() cert.Version {
+	return d.version
+}
+
+func (d *dummyCert) Curve() cert.Curve {
+	return d.curve
+}
+
+func (d *dummyCert) Groups() []string {
+	return d.groups
+}
+
+func (d *dummyCert) IsCA() bool {
+	return d.isCa
+}
+
+func (d *dummyCert) Issuer() string {
+	return d.issuer
+}
+
+func (d *dummyCert) Name() string {
+	return d.name
+}
+
+func (d *dummyCert) Networks() []netip.Prefix {
+	return d.networks
+}
+
+func (d *dummyCert) NotAfter() time.Time {
+	return d.notAfter
+}
+
+func (d *dummyCert) NotBefore() time.Time {
+	return d.notBefore
+}
+
+func (d *dummyCert) PublicKey() []byte {
+	return d.publicKey
+}
+
+func (d *dummyCert) Signature() []byte {
+	return d.signature
+}
+
+func (d *dummyCert) UnsafeNetworks() []netip.Prefix {
+	return d.unsafeNetworks
+}
+
+func (d *dummyCert) MarshalForHandshakes() ([]byte, error) {
+	return nil, nil
+}
+
+func (d *dummyCert) Sign(curve cert.Curve, key []byte) error {
+	return nil
+}
+
+func (d *dummyCert) CheckSignature(key []byte) bool {
+	return true
+}
+
+func (d *dummyCert) Expired(t time.Time) bool {
+	return false
+}
+
+func (d *dummyCert) CheckRootConstraints(signer cert.Certificate) error {
+	return nil
+}
+
+func (d *dummyCert) VerifyPrivateKey(curve cert.Curve, key []byte) error {
+	return nil
+}
+
+func (d *dummyCert) String() string {
+	return ""
+}
+
+func (d *dummyCert) Marshal() ([]byte, error) {
+	return nil, nil
+}
+
+func (d *dummyCert) MarshalPEM() ([]byte, error) {
+	return nil, nil
+}
+
+func (d *dummyCert) Fingerprint() (string, error) {
+	return "", nil
+}
+
+func (d *dummyCert) MarshalJSON() ([]byte, error) {
+	return nil, nil
+}
+
+func (d *dummyCert) Copy() cert.Certificate {
+	return d
 }

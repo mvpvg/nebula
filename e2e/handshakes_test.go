@@ -5,7 +5,8 @@ package e2e
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,19 +14,18 @@ import (
 	"github.com/slackhq/nebula"
 	"github.com/slackhq/nebula/e2e/router"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/yaml.v2"
 )
 
 func BenchmarkHotPath(b *testing.B) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, _, _, _ := newSimpleServer(ca, caKey, "me", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, _, _, _ := newSimpleServer(ca, caKey, "me", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Put their info in our lighthouse
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
 
 	// Start the servers
 	myControl.Start()
@@ -35,7 +35,7 @@ func BenchmarkHotPath(b *testing.B) {
 	r.CancelFlowLogs()
 
 	for n := 0; n < b.N; n++ {
-		myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+		myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 		_ = r.RouteForAllUntilTxTun(theirControl)
 	}
 
@@ -44,19 +44,19 @@ func BenchmarkHotPath(b *testing.B) {
 }
 
 func TestGoodHandshake(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Put their info in our lighthouse
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
 
 	// Start the servers
 	myControl.Start()
 	theirControl.Start()
 
 	t.Log("Send a udp packet through to begin standing up the tunnel, this should come out the other side")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 
 	t.Log("Have them consume my stage 0 packet. They have a tunnel now")
 	theirControl.InjectUDPPacket(myControl.GetFromUDP(true))
@@ -77,16 +77,16 @@ func TestGoodHandshake(t *testing.T) {
 	myControl.WaitForType(1, 0, theirControl)
 
 	t.Log("Make sure our host infos are correct")
-	assertHostInfoPair(t, myUdpAddr, theirUdpAddr, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl)
+	assertHostInfoPair(t, myUdpAddr, theirUdpAddr, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl)
 
 	t.Log("Get that cached packet and make sure it looks right")
 	myCachedPacket := theirControl.GetFromTun(true)
-	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 
 	t.Log("Do a bidirectional tunnel test")
 	r := router.NewR(t, myControl, theirControl)
 	defer r.RenderFlow()
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	r.RenderHostmaps("Final hostmaps", myControl, theirControl)
 	myControl.Stop()
@@ -95,20 +95,14 @@ func TestGoodHandshake(t *testing.T) {
 }
 
 func TestWrongResponderHandshake(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
 
-	// The IPs here are chosen on purpose:
-	// The current remote handling will sort by preference, public, and then lexically.
-	// So we need them to have a higher address than evil (we could apply a preference though)
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", net.IP{10, 0, 0, 100}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 99}, nil)
-	evilControl, evilVpnIp, evilUdpAddr, _ := newSimpleServer(ca, caKey, "evil", net.IP{10, 0, 0, 2}, nil)
-
-	// Add their real udp addr, which should be tried after evil.
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", "10.128.0.100/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.99/24", nil)
+	evilControl, evilVpnIp, evilUdpAddr, _ := newSimpleServer(ca, caKey, "evil", "10.128.0.2/24", nil)
 
 	// Put the evil udp addr in for their vpn Ip, this is a case of being lied to by the lighthouse.
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, evilUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), evilUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl, evilControl)
@@ -119,16 +113,36 @@ func TestWrongResponderHandshake(t *testing.T) {
 	theirControl.Start()
 	evilControl.Start()
 
-	t.Log("Start the handshake process, we will route until we see our cached packet get sent to them")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	t.Log("Start the handshake process, we will route until we see the evil tunnel closed")
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+
+	h := &header.H{}
 	r.RouteForAllExitFunc(func(p *udp.Packet, c *nebula.Control) router.ExitType {
-		h := &header.H{}
 		err := h.Parse(p.Data)
 		if err != nil {
 			panic(err)
 		}
 
-		if p.ToIp.Equal(theirUdpAddr.IP) && p.ToPort == uint16(theirUdpAddr.Port) && h.Type == 1 {
+		if h.Type == header.CloseTunnel && p.To == evilUdpAddr {
+			return router.RouteAndExit
+		}
+
+		return router.KeepRouting
+	})
+
+	t.Log("Evil tunnel is closed, inject the correct udp addr for them")
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	pendingHi := myControl.GetHostInfoByVpnIp(theirVpnIpNet.Addr(), true)
+	assert.NotContains(t, pendingHi.RemoteAddrs, evilUdpAddr)
+
+	t.Log("Route until we see the cached packet")
+	r.RouteForAllExitFunc(func(p *udp.Packet, c *nebula.Control) router.ExitType {
+		err := h.Parse(p.Data)
+		if err != nil {
+			panic(err)
+		}
+
+		if p.To == theirUdpAddr && h.Type == 1 {
 			return router.RouteAndExit
 		}
 
@@ -139,19 +153,102 @@ func TestWrongResponderHandshake(t *testing.T) {
 
 	t.Log("My cached packet should be received by them")
 	myCachedPacket := theirControl.GetFromTun(true)
-	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 
 	t.Log("Test the tunnel with them")
-	assertHostInfoPair(t, myUdpAddr, theirUdpAddr, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl)
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertHostInfoPair(t, myUdpAddr, theirUdpAddr, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	t.Log("Flush all packets from all controllers")
 	r.FlushAll()
 
 	t.Log("Ensure ensure I don't have any hostinfo artifacts from evil")
-	assert.Nil(t, myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(evilVpnIp.IP), true), "My pending hostmap should not contain evil")
-	assert.Nil(t, myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(evilVpnIp.IP), false), "My main hostmap should not contain evil")
-	//NOTE: if evil lost the handshake race it may still have a tunnel since me would reject the handshake since the tunnel is complete
+	assert.Nil(t, myControl.GetHostInfoByVpnIp(evilVpnIp.Addr(), true), "My pending hostmap should not contain evil")
+	assert.Nil(t, myControl.GetHostInfoByVpnIp(evilVpnIp.Addr(), false), "My main hostmap should not contain evil")
+
+	//TODO: assert hostmaps for everyone
+	r.RenderHostmaps("Final hostmaps", myControl, theirControl, evilControl)
+	t.Log("Success!")
+	myControl.Stop()
+	theirControl.Stop()
+}
+
+func TestWrongResponderHandshakeStaticHostMap(t *testing.T) {
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.99/24", nil)
+	evilControl, evilVpnIp, evilUdpAddr, _ := newSimpleServer(ca, caKey, "evil", "10.128.0.2/24", nil)
+	o := m{
+		"static_host_map": m{
+			theirVpnIpNet.Addr().String(): []string{evilUdpAddr.String()},
+		},
+	}
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", "10.128.0.100/24", o)
+
+	// Put the evil udp addr in for their vpn addr, this is a case of a remote at a static entry changing its vpn addr.
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), evilUdpAddr)
+
+	// Build a router so we don't have to reason who gets which packet
+	r := router.NewR(t, myControl, theirControl, evilControl)
+	defer r.RenderFlow()
+
+	// Start the servers
+	myControl.Start()
+	theirControl.Start()
+	evilControl.Start()
+
+	t.Log("Start the handshake process, we will route until we see the evil tunnel closed")
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+
+	h := &header.H{}
+	r.RouteForAllExitFunc(func(p *udp.Packet, c *nebula.Control) router.ExitType {
+		err := h.Parse(p.Data)
+		if err != nil {
+			panic(err)
+		}
+
+		if h.Type == header.CloseTunnel && p.To == evilUdpAddr {
+			return router.RouteAndExit
+		}
+
+		return router.KeepRouting
+	})
+
+	t.Log("Evil tunnel is closed, inject the correct udp addr for them")
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	pendingHi := myControl.GetHostInfoByVpnIp(theirVpnIpNet.Addr(), true)
+	assert.NotContains(t, pendingHi.RemoteAddrs, evilUdpAddr)
+
+	t.Log("Route until we see the cached packet")
+	r.RouteForAllExitFunc(func(p *udp.Packet, c *nebula.Control) router.ExitType {
+		err := h.Parse(p.Data)
+		if err != nil {
+			panic(err)
+		}
+
+		if p.To == theirUdpAddr && h.Type == 1 {
+			return router.RouteAndExit
+		}
+
+		return router.KeepRouting
+	})
+
+	//TODO: Assert pending hostmap - I should have a correct hostinfo for them now
+
+	t.Log("My cached packet should be received by them")
+	myCachedPacket := theirControl.GetFromTun(true)
+	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
+
+	t.Log("Test the tunnel with them")
+	assertHostInfoPair(t, myUdpAddr, theirUdpAddr, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
+
+	t.Log("Flush all packets from all controllers")
+	r.FlushAll()
+
+	t.Log("Ensure ensure I don't have any hostinfo artifacts from evil")
+	assert.Nil(t, myControl.GetHostInfoByVpnIp(evilVpnIp.Addr(), true), "My pending hostmap should not contain evil")
+	assert.Nil(t, myControl.GetHostInfoByVpnIp(evilVpnIp.Addr(), false), "My main hostmap should not contain evil")
 
 	//TODO: assert hostmaps for everyone
 	r.RenderHostmaps("Final hostmaps", myControl, theirControl, evilControl)
@@ -164,13 +261,13 @@ func TestStage1Race(t *testing.T) {
 	// This tests ensures that two hosts handshaking with each other at the same time will allow traffic to flow
 	// But will eventually collapse down to a single tunnel
 
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Put their info in our lighthouse and vice versa
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl)
@@ -181,8 +278,8 @@ func TestStage1Race(t *testing.T) {
 	theirControl.Start()
 
 	t.Log("Trigger a handshake to start on both me and them")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
-	theirControl.InjectTunUDPPacket(myVpnIpNet.IP, 80, 80, []byte("Hi from them"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+	theirControl.InjectTunUDPPacket(myVpnIpNet.Addr(), 80, 80, []byte("Hi from them"))
 
 	t.Log("Get both stage 1 handshake packets")
 	myHsForThem := myControl.GetFromUDP(true)
@@ -194,14 +291,14 @@ func TestStage1Race(t *testing.T) {
 
 	r.Log("Route until they receive a message packet")
 	myCachedPacket := r.RouteForAllUntilTxTun(theirControl)
-	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), myCachedPacket, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 
 	r.Log("Their cached packet should be received by me")
 	theirCachedPacket := r.RouteForAllUntilTxTun(myControl)
-	assertUdpPacket(t, []byte("Hi from them"), theirCachedPacket, theirVpnIpNet.IP, myVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from them"), theirCachedPacket, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), 80, 80)
 
 	r.Log("Do a bidirectional tunnel test")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	myHostmapHosts := myControl.ListHostmapHosts(false)
 	myHostmapIndexes := myControl.ListHostmapIndexes(false)
@@ -219,7 +316,7 @@ func TestStage1Race(t *testing.T) {
 	r.Log("Spin until connection manager tears down a tunnel")
 
 	for len(myControl.GetHostmap().Indexes)+len(theirControl.GetHostmap().Indexes) > 2 {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		t.Log("Connection manager hasn't ticked yet")
 		time.Sleep(time.Second)
 	}
@@ -241,13 +338,13 @@ func TestStage1Race(t *testing.T) {
 }
 
 func TestUncleanShutdownRaceLoser(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl)
@@ -258,28 +355,28 @@ func TestUncleanShutdownRaceLoser(t *testing.T) {
 	theirControl.Start()
 
 	r.Log("Trigger a handshake from me to them")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 
 	p := r.RouteForAllUntilTxTun(theirControl)
-	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 
 	r.Log("Nuke my hostmap")
 	myHostmap := myControl.GetHostmap()
-	myHostmap.Hosts = map[iputil.VpnIp]*nebula.HostInfo{}
+	myHostmap.Hosts = map[netip.Addr]*nebula.HostInfo{}
 	myHostmap.Indexes = map[uint32]*nebula.HostInfo{}
 	myHostmap.RemoteIndexes = map[uint32]*nebula.HostInfo{}
 
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me again"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me again"))
 	p = r.RouteForAllUntilTxTun(theirControl)
-	assertUdpPacket(t, []byte("Hi from me again"), p, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me again"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 
 	r.Log("Assert the tunnel works")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	r.Log("Wait for the dead index to go away")
 	start := len(theirControl.GetHostmap().Indexes)
 	for {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		if len(theirControl.GetHostmap().Indexes) < start {
 			break
 		}
@@ -290,13 +387,13 @@ func TestUncleanShutdownRaceLoser(t *testing.T) {
 }
 
 func TestUncleanShutdownRaceWinner(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me  ", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl)
@@ -307,30 +404,30 @@ func TestUncleanShutdownRaceWinner(t *testing.T) {
 	theirControl.Start()
 
 	r.Log("Trigger a handshake from me to them")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 
 	p := r.RouteForAllUntilTxTun(theirControl)
-	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 	r.RenderHostmaps("Final hostmaps", myControl, theirControl)
 
 	r.Log("Nuke my hostmap")
 	theirHostmap := theirControl.GetHostmap()
-	theirHostmap.Hosts = map[iputil.VpnIp]*nebula.HostInfo{}
+	theirHostmap.Hosts = map[netip.Addr]*nebula.HostInfo{}
 	theirHostmap.Indexes = map[uint32]*nebula.HostInfo{}
 	theirHostmap.RemoteIndexes = map[uint32]*nebula.HostInfo{}
 
-	theirControl.InjectTunUDPPacket(myVpnIpNet.IP, 80, 80, []byte("Hi from them again"))
+	theirControl.InjectTunUDPPacket(myVpnIpNet.Addr(), 80, 80, []byte("Hi from them again"))
 	p = r.RouteForAllUntilTxTun(myControl)
-	assertUdpPacket(t, []byte("Hi from them again"), p, theirVpnIpNet.IP, myVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from them again"), p, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), 80, 80)
 	r.RenderHostmaps("Derp hostmaps", myControl, theirControl)
 
 	r.Log("Assert the tunnel works")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	r.Log("Wait for the dead index to go away")
 	start := len(myControl.GetHostmap().Indexes)
 	for {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		if len(myControl.GetHostmap().Indexes) < start {
 			break
 		}
@@ -341,15 +438,15 @@ func TestUncleanShutdownRaceWinner(t *testing.T) {
 }
 
 func TestRelays(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, _, _ := newSimpleServer(ca, caKey, "me     ", net.IP{10, 0, 0, 1}, m{"relay": m{"use_relays": true}})
-	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", net.IP{10, 0, 0, 128}, m{"relay": m{"am_relay": true}})
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", net.IP{10, 0, 0, 2}, m{"relay": m{"use_relays": true}})
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServer(ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
-	myControl.InjectRelays(theirVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
-	relayControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
+	myControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
+	myControl.InjectRelays(theirVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
+	relayControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, relayControl, theirControl)
@@ -361,31 +458,31 @@ func TestRelays(t *testing.T) {
 	theirControl.Start()
 
 	t.Log("Trigger a handshake from me to them via the relay")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 
 	p := r.RouteForAllUntilTxTun(theirControl)
 	r.Log("Assert the tunnel works")
-	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 	r.RenderHostmaps("Final hostmaps", myControl, relayControl, theirControl)
 	//TODO: assert we actually used the relay even though it should be impossible for a tunnel to have occurred without it
 }
 
 func TestStage1RaceRelays(t *testing.T) {
 	//NOTE: this is a race between me and relay resulting in a full tunnel from me to them via relay
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me     ", net.IP{10, 0, 0, 1}, m{"relay": m{"use_relays": true}})
-	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", net.IP{10, 0, 0, 128}, m{"relay": m{"am_relay": true}})
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", net.IP{10, 0, 0, 2}, m{"relay": m{"use_relays": true}})
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
-	theirControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
+	myControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
+	theirControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
 
-	myControl.InjectRelays(theirVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
-	theirControl.InjectRelays(myVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
+	myControl.InjectRelays(theirVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
+	theirControl.InjectRelays(myVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
 
-	relayControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	relayControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	relayControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	relayControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, relayControl, theirControl)
@@ -397,14 +494,14 @@ func TestStage1RaceRelays(t *testing.T) {
 	theirControl.Start()
 
 	r.Log("Get a tunnel between me and relay")
-	assertTunnel(t, myVpnIpNet.IP, relayVpnIpNet.IP, myControl, relayControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), relayVpnIpNet.Addr(), myControl, relayControl, r)
 
 	r.Log("Get a tunnel between them and relay")
-	assertTunnel(t, theirVpnIpNet.IP, relayVpnIpNet.IP, theirControl, relayControl, r)
+	assertTunnel(t, theirVpnIpNet.Addr(), relayVpnIpNet.Addr(), theirControl, relayControl, r)
 
 	r.Log("Trigger a handshake from both them and me via relay to them and me")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
-	theirControl.InjectTunUDPPacket(myVpnIpNet.IP, 80, 80, []byte("Hi from them"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+	theirControl.InjectTunUDPPacket(myVpnIpNet.Addr(), 80, 80, []byte("Hi from them"))
 
 	r.Log("Wait for a packet from them to me")
 	p := r.RouteForAllUntilTxTun(myControl)
@@ -421,21 +518,21 @@ func TestStage1RaceRelays(t *testing.T) {
 
 func TestStage1RaceRelays2(t *testing.T) {
 	//NOTE: this is a race between me and relay resulting in a full tunnel from me to them via relay
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me     ", net.IP{10, 0, 0, 1}, m{"relay": m{"use_relays": true}})
-	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", net.IP{10, 0, 0, 128}, m{"relay": m{"am_relay": true}})
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", net.IP{10, 0, 0, 2}, m{"relay": m{"use_relays": true}})
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
 	l := NewTestLogger()
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
-	theirControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
+	myControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
+	theirControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
 
-	myControl.InjectRelays(theirVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
-	theirControl.InjectRelays(myVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
+	myControl.InjectRelays(theirVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
+	theirControl.InjectRelays(myVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
 
-	relayControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	relayControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	relayControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	relayControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, relayControl, theirControl)
@@ -448,16 +545,16 @@ func TestStage1RaceRelays2(t *testing.T) {
 
 	r.Log("Get a tunnel between me and relay")
 	l.Info("Get a tunnel between me and relay")
-	assertTunnel(t, myVpnIpNet.IP, relayVpnIpNet.IP, myControl, relayControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), relayVpnIpNet.Addr(), myControl, relayControl, r)
 
 	r.Log("Get a tunnel between them and relay")
 	l.Info("Get a tunnel between them and relay")
-	assertTunnel(t, theirVpnIpNet.IP, relayVpnIpNet.IP, theirControl, relayControl, r)
+	assertTunnel(t, theirVpnIpNet.Addr(), relayVpnIpNet.Addr(), theirControl, relayControl, r)
 
 	r.Log("Trigger a handshake from both them and me via relay to them and me")
 	l.Info("Trigger a handshake from both them and me via relay to them and me")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
-	theirControl.InjectTunUDPPacket(myVpnIpNet.IP, 80, 80, []byte("Hi from them"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+	theirControl.InjectTunUDPPacket(myVpnIpNet.Addr(), 80, 80, []byte("Hi from them"))
 
 	//r.RouteUntilAfterMsgType(myControl, header.Control, header.MessageNone)
 	//r.RouteUntilAfterMsgType(theirControl, header.Control, header.MessageNone)
@@ -470,7 +567,7 @@ func TestStage1RaceRelays2(t *testing.T) {
 
 	r.Log("Assert the tunnel works")
 	l.Info("Assert the tunnel works")
-	assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+	assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 
 	t.Log("Wait until we remove extra tunnels")
 	l.Info("Wait until we remove extra tunnels")
@@ -490,7 +587,7 @@ func TestStage1RaceRelays2(t *testing.T) {
 				"theirControl": len(theirControl.GetHostmap().Indexes),
 				"relayControl": len(relayControl.GetHostmap().Indexes),
 			}).Info("Waiting for hostinfos to be removed...")
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		t.Log("Connection manager hasn't ticked yet")
 		time.Sleep(time.Second)
 		retries--
@@ -498,7 +595,7 @@ func TestStage1RaceRelays2(t *testing.T) {
 
 	r.Log("Assert the tunnel works")
 	l.Info("Assert the tunnel works")
-	assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+	assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 
 	myControl.Stop()
 	theirControl.Stop()
@@ -507,16 +604,17 @@ func TestStage1RaceRelays2(t *testing.T) {
 	//
 	////TODO: assert hostmaps
 }
+
 func TestRehandshakingRelays(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, _, _ := newSimpleServer(ca, caKey, "me     ", net.IP{10, 0, 0, 1}, m{"relay": m{"use_relays": true}})
-	relayControl, relayVpnIpNet, relayUdpAddr, relayConfig := newSimpleServer(ca, caKey, "relay  ", net.IP{10, 0, 0, 128}, m{"relay": m{"am_relay": true}})
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", net.IP{10, 0, 0, 2}, m{"relay": m{"use_relays": true}})
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServer(ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, relayConfig := newSimpleServer(ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
 
 	// Teach my how to get to the relay and that their can be reached via the relay
-	myControl.InjectLightHouseAddr(relayVpnIpNet.IP, relayUdpAddr)
-	myControl.InjectRelays(theirVpnIpNet.IP, []net.IP{relayVpnIpNet.IP})
-	relayControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
+	myControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
+	myControl.InjectRelays(theirVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
+	relayControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, relayControl, theirControl)
@@ -528,19 +626,19 @@ func TestRehandshakingRelays(t *testing.T) {
 	theirControl.Start()
 
 	t.Log("Trigger a handshake from me to them via the relay")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
 
 	p := r.RouteForAllUntilTxTun(theirControl)
 	r.Log("Assert the tunnel works")
-	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.IP, theirVpnIpNet.IP, 80, 80)
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
 	r.RenderHostmaps("working hostmaps", myControl, relayControl, theirControl)
 
 	// When I update the certificate for the relay, both me and them will have 2 host infos for the relay,
 	// and the main host infos will not have any relay state to handle the me<->relay<->them tunnel.
 	r.Log("Renew relay certificate and spin until me and them sees it")
-	_, _, myNextPrivKey, myNextPEM := newTestCert(ca, caKey, "relay", time.Now(), time.Now().Add(5*time.Minute), relayVpnIpNet, nil, []string{"new group"})
+	_, _, myNextPrivKey, myNextPEM := NewTestCert(ca, caKey, "relay", time.Now(), time.Now().Add(5*time.Minute), []netip.Prefix{relayVpnIpNet}, nil, []string{"new group"})
 
-	caB, err := ca.MarshalToPEM()
+	caB, err := ca.MarshalPEM()
 	if err != nil {
 		panic(err)
 	}
@@ -556,9 +654,9 @@ func TestRehandshakingRelays(t *testing.T) {
 
 	for {
 		r.Log("Assert the tunnel works between myVpnIpNet and relayVpnIpNet")
-		assertTunnel(t, myVpnIpNet.IP, relayVpnIpNet.IP, myControl, relayControl, r)
-		c := myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(relayVpnIpNet.IP), false)
-		if len(c.Cert.Details.Groups) != 0 {
+		assertTunnel(t, myVpnIpNet.Addr(), relayVpnIpNet.Addr(), myControl, relayControl, r)
+		c := myControl.GetHostInfoByVpnIp(relayVpnIpNet.Addr(), false)
+		if len(c.Cert.Groups()) != 0 {
 			// We have a new certificate now
 			r.Log("Certificate between my and relay is updated!")
 			break
@@ -569,9 +667,9 @@ func TestRehandshakingRelays(t *testing.T) {
 
 	for {
 		r.Log("Assert the tunnel works between theirVpnIpNet and relayVpnIpNet")
-		assertTunnel(t, theirVpnIpNet.IP, relayVpnIpNet.IP, theirControl, relayControl, r)
-		c := theirControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(relayVpnIpNet.IP), false)
-		if len(c.Cert.Details.Groups) != 0 {
+		assertTunnel(t, theirVpnIpNet.Addr(), relayVpnIpNet.Addr(), theirControl, relayControl, r)
+		c := theirControl.GetHostInfoByVpnIp(relayVpnIpNet.Addr(), false)
+		if len(c.Cert.Groups()) != 0 {
 			// We have a new certificate now
 			r.Log("Certificate between their and relay is updated!")
 			break
@@ -581,13 +679,13 @@ func TestRehandshakingRelays(t *testing.T) {
 	}
 
 	r.Log("Assert the relay tunnel still works")
-	assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+	assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 	r.RenderHostmaps("working hostmaps", myControl, relayControl, theirControl)
 	// We should have two hostinfos on all sides
 	for len(myControl.GetHostmap().Indexes) != 2 {
 		t.Logf("Waiting for myControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(myControl.GetHostmap().Indexes))
 		r.Log("Assert the relay tunnel still works")
-		assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 		r.Log("yupitdoes")
 		time.Sleep(time.Second)
 	}
@@ -595,7 +693,7 @@ func TestRehandshakingRelays(t *testing.T) {
 	for len(theirControl.GetHostmap().Indexes) != 2 {
 		t.Logf("Waiting for theirControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(theirControl.GetHostmap().Indexes))
 		r.Log("Assert the relay tunnel still works")
-		assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 		r.Log("yupitdoes")
 		time.Sleep(time.Second)
 	}
@@ -603,7 +701,111 @@ func TestRehandshakingRelays(t *testing.T) {
 	for len(relayControl.GetHostmap().Indexes) != 2 {
 		t.Logf("Waiting for relayControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(relayControl.GetHostmap().Indexes))
 		r.Log("Assert the relay tunnel still works")
-		assertTunnel(t, theirVpnIpNet.IP, myVpnIpNet.IP, theirControl, myControl, r)
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
+		r.Log("yupitdoes")
+		time.Sleep(time.Second)
+	}
+	t.Logf("relayControl hostinfos got cleaned up!")
+}
+
+func TestRehandshakingRelaysPrimary(t *testing.T) {
+	// This test is the same as TestRehandshakingRelays but one of the terminal types is a primary swap winner
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, _, _ := newSimpleServer(ca, caKey, "me     ", "10.128.0.128/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, relayConfig := newSimpleServer(ca, caKey, "relay  ", "10.128.0.1/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
+
+	// Teach my how to get to the relay and that their can be reached via the relay
+	myControl.InjectLightHouseAddr(relayVpnIpNet.Addr(), relayUdpAddr)
+	myControl.InjectRelays(theirVpnIpNet.Addr(), []netip.Addr{relayVpnIpNet.Addr()})
+	relayControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+
+	// Build a router so we don't have to reason who gets which packet
+	r := router.NewR(t, myControl, relayControl, theirControl)
+	defer r.RenderFlow()
+
+	// Start the servers
+	myControl.Start()
+	relayControl.Start()
+	theirControl.Start()
+
+	t.Log("Trigger a handshake from me to them via the relay")
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+
+	p := r.RouteForAllUntilTxTun(theirControl)
+	r.Log("Assert the tunnel works")
+	assertUdpPacket(t, []byte("Hi from me"), p, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), 80, 80)
+	r.RenderHostmaps("working hostmaps", myControl, relayControl, theirControl)
+
+	// When I update the certificate for the relay, both me and them will have 2 host infos for the relay,
+	// and the main host infos will not have any relay state to handle the me<->relay<->them tunnel.
+	r.Log("Renew relay certificate and spin until me and them sees it")
+	_, _, myNextPrivKey, myNextPEM := NewTestCert(ca, caKey, "relay", time.Now(), time.Now().Add(5*time.Minute), []netip.Prefix{relayVpnIpNet}, nil, []string{"new group"})
+
+	caB, err := ca.MarshalPEM()
+	if err != nil {
+		panic(err)
+	}
+
+	relayConfig.Settings["pki"] = m{
+		"ca":   string(caB),
+		"cert": string(myNextPEM),
+		"key":  string(myNextPrivKey),
+	}
+	rc, err := yaml.Marshal(relayConfig.Settings)
+	assert.NoError(t, err)
+	relayConfig.ReloadConfigString(string(rc))
+
+	for {
+		r.Log("Assert the tunnel works between myVpnIpNet and relayVpnIpNet")
+		assertTunnel(t, myVpnIpNet.Addr(), relayVpnIpNet.Addr(), myControl, relayControl, r)
+		c := myControl.GetHostInfoByVpnIp(relayVpnIpNet.Addr(), false)
+		if len(c.Cert.Groups()) != 0 {
+			// We have a new certificate now
+			r.Log("Certificate between my and relay is updated!")
+			break
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	for {
+		r.Log("Assert the tunnel works between theirVpnIpNet and relayVpnIpNet")
+		assertTunnel(t, theirVpnIpNet.Addr(), relayVpnIpNet.Addr(), theirControl, relayControl, r)
+		c := theirControl.GetHostInfoByVpnIp(relayVpnIpNet.Addr(), false)
+		if len(c.Cert.Groups()) != 0 {
+			// We have a new certificate now
+			r.Log("Certificate between their and relay is updated!")
+			break
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	r.Log("Assert the relay tunnel still works")
+	assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
+	r.RenderHostmaps("working hostmaps", myControl, relayControl, theirControl)
+	// We should have two hostinfos on all sides
+	for len(myControl.GetHostmap().Indexes) != 2 {
+		t.Logf("Waiting for myControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(myControl.GetHostmap().Indexes))
+		r.Log("Assert the relay tunnel still works")
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
+		r.Log("yupitdoes")
+		time.Sleep(time.Second)
+	}
+	t.Logf("myControl hostinfos got cleaned up!")
+	for len(theirControl.GetHostmap().Indexes) != 2 {
+		t.Logf("Waiting for theirControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(theirControl.GetHostmap().Indexes))
+		r.Log("Assert the relay tunnel still works")
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
+		r.Log("yupitdoes")
+		time.Sleep(time.Second)
+	}
+	t.Logf("theirControl hostinfos got cleaned up!")
+	for len(relayControl.GetHostmap().Indexes) != 2 {
+		t.Logf("Waiting for relayControl hostinfos (%v != 2) to get cleaned up from lack of use...", len(relayControl.GetHostmap().Indexes))
+		r.Log("Assert the relay tunnel still works")
+		assertTunnel(t, theirVpnIpNet.Addr(), myVpnIpNet.Addr(), theirControl, myControl, r)
 		r.Log("yupitdoes")
 		time.Sleep(time.Second)
 	}
@@ -611,13 +813,13 @@ func TestRehandshakingRelays(t *testing.T) {
 }
 
 func TestRehandshaking(t *testing.T) {
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, myConfig := newSimpleServer(ca, caKey, "me  ", net.IP{10, 0, 0, 2}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, theirConfig := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 1}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, myConfig := newSimpleServer(ca, caKey, "me  ", "10.128.0.2/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, theirConfig := newSimpleServer(ca, caKey, "them", "10.128.0.1/24", nil)
 
 	// Put their info in our lighthouse and vice versa
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl)
@@ -628,14 +830,14 @@ func TestRehandshaking(t *testing.T) {
 	theirControl.Start()
 
 	t.Log("Stand up a tunnel between me and them")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	r.RenderHostmaps("Starting hostmaps", myControl, theirControl)
 
 	r.Log("Renew my certificate and spin until their sees it")
-	_, _, myNextPrivKey, myNextPEM := newTestCert(ca, caKey, "me", time.Now(), time.Now().Add(5*time.Minute), myVpnIpNet, nil, []string{"new group"})
+	_, _, myNextPrivKey, myNextPEM := NewTestCert(ca, caKey, "me", time.Now(), time.Now().Add(5*time.Minute), []netip.Prefix{myVpnIpNet}, nil, []string{"new group"})
 
-	caB, err := ca.MarshalToPEM()
+	caB, err := ca.MarshalPEM()
 	if err != nil {
 		panic(err)
 	}
@@ -650,9 +852,9 @@ func TestRehandshaking(t *testing.T) {
 	myConfig.ReloadConfigString(string(rc))
 
 	for {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
-		c := theirControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(myVpnIpNet.IP), false)
-		if len(c.Cert.Details.Groups) != 0 {
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
+		c := theirControl.GetHostInfoByVpnIp(myVpnIpNet.Addr(), false)
+		if len(c.Cert.Groups()) != 0 {
 			// We have a new certificate now
 			break
 		}
@@ -660,6 +862,7 @@ func TestRehandshaking(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 
+	r.Log("Got the new cert")
 	// Flip their firewall to only allowing the new group to catch the tunnels reverting incorrectly
 	rc, err = yaml.Marshal(theirConfig.Settings)
 	assert.NoError(t, err)
@@ -677,20 +880,20 @@ func TestRehandshaking(t *testing.T) {
 
 	r.Log("Spin until there is only 1 tunnel")
 	for len(myControl.GetHostmap().Indexes)+len(theirControl.GetHostmap().Indexes) > 2 {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		t.Log("Connection manager hasn't ticked yet")
 		time.Sleep(time.Second)
 	}
 
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 	myFinalHostmapHosts := myControl.ListHostmapHosts(false)
 	myFinalHostmapIndexes := myControl.ListHostmapIndexes(false)
 	theirFinalHostmapHosts := theirControl.ListHostmapHosts(false)
 	theirFinalHostmapIndexes := theirControl.ListHostmapIndexes(false)
 
 	// Make sure the correct tunnel won
-	c := theirControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(myVpnIpNet.IP), false)
-	assert.Contains(t, c.Cert.Details.Groups, "new group")
+	c := theirControl.GetHostInfoByVpnIp(myVpnIpNet.Addr(), false)
+	assert.Contains(t, c.Cert.Groups(), "new group")
 
 	// We should only have a single tunnel now on both sides
 	assert.Len(t, myFinalHostmapHosts, 1)
@@ -707,13 +910,13 @@ func TestRehandshaking(t *testing.T) {
 func TestRehandshakingLoser(t *testing.T) {
 	// The purpose of this test is that the race loser renews their certificate and rehandshakes. The final tunnel
 	// Should be the one with the new certificate
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, myConfig := newSimpleServer(ca, caKey, "me  ", net.IP{10, 0, 0, 2}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, theirConfig := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 1}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, myConfig := newSimpleServer(ca, caKey, "me  ", "10.128.0.2/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, theirConfig := newSimpleServer(ca, caKey, "them", "10.128.0.1/24", nil)
 
 	// Put their info in our lighthouse and vice versa
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Build a router so we don't have to reason who gets which packet
 	r := router.NewR(t, myControl, theirControl)
@@ -724,18 +927,18 @@ func TestRehandshakingLoser(t *testing.T) {
 	theirControl.Start()
 
 	t.Log("Stand up a tunnel between me and them")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
-	tt1 := myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(theirVpnIpNet.IP), false)
-	tt2 := theirControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(myVpnIpNet.IP), false)
+	tt1 := myControl.GetHostInfoByVpnIp(theirVpnIpNet.Addr(), false)
+	tt2 := theirControl.GetHostInfoByVpnIp(myVpnIpNet.Addr(), false)
 	fmt.Println(tt1.LocalIndex, tt2.LocalIndex)
 
 	r.RenderHostmaps("Starting hostmaps", myControl, theirControl)
 
 	r.Log("Renew their certificate and spin until mine sees it")
-	_, _, theirNextPrivKey, theirNextPEM := newTestCert(ca, caKey, "them", time.Now(), time.Now().Add(5*time.Minute), theirVpnIpNet, nil, []string{"their new group"})
+	_, _, theirNextPrivKey, theirNextPEM := NewTestCert(ca, caKey, "them", time.Now(), time.Now().Add(5*time.Minute), []netip.Prefix{theirVpnIpNet}, nil, []string{"their new group"})
 
-	caB, err := ca.MarshalToPEM()
+	caB, err := ca.MarshalPEM()
 	if err != nil {
 		panic(err)
 	}
@@ -750,11 +953,10 @@ func TestRehandshakingLoser(t *testing.T) {
 	theirConfig.ReloadConfigString(string(rc))
 
 	for {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
-		theirCertInMe := myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(theirVpnIpNet.IP), false)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
+		theirCertInMe := myControl.GetHostInfoByVpnIp(theirVpnIpNet.Addr(), false)
 
-		_, theirNewGroup := theirCertInMe.Cert.Details.InvertedGroups["their new group"]
-		if theirNewGroup {
+		if slices.Contains(theirCertInMe.Cert.Groups(), "their new group") {
 			break
 		}
 
@@ -778,20 +980,20 @@ func TestRehandshakingLoser(t *testing.T) {
 
 	r.Log("Spin until there is only 1 tunnel")
 	for len(myControl.GetHostmap().Indexes)+len(theirControl.GetHostmap().Indexes) > 2 {
-		assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+		assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 		t.Log("Connection manager hasn't ticked yet")
 		time.Sleep(time.Second)
 	}
 
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 	myFinalHostmapHosts := myControl.ListHostmapHosts(false)
 	myFinalHostmapIndexes := myControl.ListHostmapIndexes(false)
 	theirFinalHostmapHosts := theirControl.ListHostmapHosts(false)
 	theirFinalHostmapIndexes := theirControl.ListHostmapIndexes(false)
 
 	// Make sure the correct tunnel won
-	theirCertInMe := myControl.GetHostInfoByVpnIp(iputil.Ip2VpnIp(theirVpnIpNet.IP), false)
-	assert.Contains(t, theirCertInMe.Cert.Details.Groups, "their new group")
+	theirCertInMe := myControl.GetHostInfoByVpnIp(theirVpnIpNet.Addr(), false)
+	assert.Contains(t, theirCertInMe.Cert.Groups(), "their new group")
 
 	// We should only have a single tunnel now on both sides
 	assert.Len(t, myFinalHostmapHosts, 1)
@@ -808,13 +1010,13 @@ func TestRaceRegression(t *testing.T) {
 	// This test forces stage 1, stage 2, stage 1 to be received by me from them
 	// We had a bug where we were not finding the duplicate handshake and responding to the final stage 1 which
 	// caused a cross-linked hostinfo
-	ca, _, caKey, _ := newTestCaCert(time.Now(), time.Now().Add(10*time.Minute), []*net.IPNet{}, []*net.IPNet{}, []string{})
-	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", net.IP{10, 0, 0, 1}, nil)
-	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", net.IP{10, 0, 0, 2}, nil)
+	ca, _, caKey, _ := NewTestCaCert(time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(ca, caKey, "me", "10.128.0.1/24", nil)
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(ca, caKey, "them", "10.128.0.2/24", nil)
 
 	// Put their info in our lighthouse
-	myControl.InjectLightHouseAddr(theirVpnIpNet.IP, theirUdpAddr)
-	theirControl.InjectLightHouseAddr(myVpnIpNet.IP, myUdpAddr)
+	myControl.InjectLightHouseAddr(theirVpnIpNet.Addr(), theirUdpAddr)
+	theirControl.InjectLightHouseAddr(myVpnIpNet.Addr(), myUdpAddr)
 
 	// Start the servers
 	myControl.Start()
@@ -828,8 +1030,8 @@ func TestRaceRegression(t *testing.T) {
 	//them rx stage:2 initiatorIndex=120607833 responderIndex=4209862089
 
 	t.Log("Start both handshakes")
-	myControl.InjectTunUDPPacket(theirVpnIpNet.IP, 80, 80, []byte("Hi from me"))
-	theirControl.InjectTunUDPPacket(myVpnIpNet.IP, 80, 80, []byte("Hi from them"))
+	myControl.InjectTunUDPPacket(theirVpnIpNet.Addr(), 80, 80, []byte("Hi from me"))
+	theirControl.InjectTunUDPPacket(myVpnIpNet.Addr(), 80, 80, []byte("Hi from them"))
 
 	t.Log("Get both stage 1")
 	myStage1ForThem := myControl.GetFromUDP(true)
@@ -859,7 +1061,7 @@ func TestRaceRegression(t *testing.T) {
 	r.RenderHostmaps("Starting hostmaps", myControl, theirControl)
 
 	t.Log("Make sure the tunnel still works")
-	assertTunnel(t, myVpnIpNet.IP, theirVpnIpNet.IP, myControl, theirControl, r)
+	assertTunnel(t, myVpnIpNet.Addr(), theirVpnIpNet.Addr(), myControl, theirControl, r)
 
 	myControl.Stop()
 	theirControl.Stop()

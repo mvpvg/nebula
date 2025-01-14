@@ -7,6 +7,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.4] - 2024-09-09
+
+### Added
+
+- Support UDP dialing with gVisor. (#1181)
+
+### Changed
+
+- Make some Nebula state programmatically available via control object. (#1188)
+- Switch internal representation of IPs to netip, to prepare for IPv6 support
+  in the overlay. (#1173)
+- Minor build and cleanup changes. (#1171, #1164, #1162)
+- Various dependency updates. (#1195, #1190, #1174, #1168, #1167, #1161, #1147, #1146)
+
+### Fixed
+
+- Fix a bug on big endian hosts, like mips. (#1194)
+- Fix a rare panic if a local index collision happens. (#1191)
+- Fix integer wraparound in the calculation of handshake timeouts on 32-bit targets. (#1185)
+
+## [1.9.3] - 2024-06-06
+
+### Fixed
+
+- Initialize messageCounter to 2 instead of verifying later. (#1156)
+
+## [1.9.2] - 2024-06-03
+
+### Fixed
+
+- Ensure messageCounter is set before handshake is complete. (#1154)
+
+## [1.9.1] - 2024-05-29
+
+### Fixed
+
+- Fixed a potential deadlock in GetOrHandshake. (#1151)
+
+## [1.9.0] - 2024-05-07
+
+### Deprecated
+
+- This release adds a new setting `default_local_cidr_any` that defaults to
+  true to match previous behavior, but will default to false in the next
+  release (1.10). When set to false, `local_cidr` is matched correctly for
+  firewall rules on hosts acting as unsafe routers, and should be set for any
+  firewall rules you want to allow unsafe route hosts to access. See the issue
+  and example config for more details. (#1071, #1099)
+
+### Added
+
+- Nebula now has an official Docker image `nebulaoss/nebula` that is
+  distroless and contains just the `nebula` and `nebula-cert` binaries. You
+  can find it here: https://hub.docker.com/r/nebulaoss/nebula (#1037)
+
+- Experimental binaries for `loong64` are now provided. (#1003)
+
+- Added example service script for OpenRC. (#711)
+
+- The SSH daemon now supports inlined host keys. (#1054)
+
+- The SSH daemon now supports certificates with `sshd.trusted_cas`. (#1098)
+
+### Changed
+
+- Config setting `tun.unsafe_routes` is now reloadable. (#1083)
+
+- Small documentation and internal improvements. (#1065, #1067, #1069, #1108,
+  #1109, #1111, #1135)
+
+- Various dependency updates. (#1139, #1138, #1134, #1133, #1126, #1123, #1110,
+  #1094, #1092, #1087, #1086, #1085, #1072, #1063, #1059, #1055, #1053, #1047,
+  #1046, #1034, #1022)
+
+### Removed
+
+- Support for the deprecated `local_range` option has been removed. Please
+  change to `preferred_ranges` (which is also now reloadable). (#1043)
+
+- We are now building with go1.22, which means that for Windows you need at
+  least Windows 10 or Windows Server 2016. This is because support for earlier
+  versions was removed in Go 1.21. See https://go.dev/doc/go1.21#windows (#981)
+
+- Removed vagrant example, as it was unmaintained. (#1129)
+
+- Removed Fedora and Arch nebula.service files, as they are maintained in the
+  upstream repos. (#1128, #1132)
+
+- Remove the TCP round trip tracking metrics, as they never had correct data
+  and were an experiment to begin with. (#1114)
+
+### Fixed
+
+- Fixed a potential deadlock introduced in 1.8.1. (#1112)
+
+- Fixed support for Linux when IPv6 has been disabled at the OS level. (#787)
+
+- DNS will return NXDOMAIN now when there are no results. (#845)
+
+- Allow `::` in `lighthouse.dns.host`. (#1115)
+
+- Capitalization of `NotAfter` fixed in DNS TXT response. (#1127)
+
+- Don't log invalid certificates. It is untrusted data and can cause a large
+  volume of logs. (#1116)
+
+## [1.8.2] - 2024-01-08
+
+### Fixed
+
+- Fix multiple routines when listen.port is zero. This was a regression
+  introduced in v1.6.0. (#1057)
+
+### Changed
+
+- Small dependency update for Noise. (#1038)
+
+## [1.8.1] - 2023-12-19
+
+### Security
+
+- Update `golang.org/x/crypto`, which includes a fix for CVE-2023-48795. (#1048)
+
+### Fixed
+
+- Fix a deadlock introduced in v1.8.0 that could occur during handshakes. (#1044)
+
+- Fix mobile builds. (#1035)
+
+## [1.8.0] - 2023-12-06
+
+### Deprecated
+
+- The next minor release of Nebula, 1.9.0, will require at least Windows 10 or
+  Windows Server 2016. This is because support for earlier versions was removed
+  in Go 1.21. See https://go.dev/doc/go1.21#windows
+
+### Added
+
+- Linux: Notify systemd of service readiness. This should resolve timing issues
+  with services that depend on Nebula being active. For an example of how to
+  enable this, see: `examples/service_scripts/nebula.service`. (#929)
+
+- Windows: Use Registered IO (RIO) when possible. Testing on a Windows 11
+  machine shows ~50x improvement in throughput. (#905)
+
+- NetBSD, OpenBSD: Added rudimentary support. (#916, #812)
+
+- FreeBSD: Add support for naming tun devices. (#903)
+
+### Changed
+
+- `pki.disconnect_invalid` will now default to true. This means that once a
+  certificate expires, the tunnel will be disconnected. If you use SIGHUP to
+  reload certificates without restarting Nebula, you should ensure all of your
+  clients are on 1.7.0 or newer before you enable this feature. (#859)
+
+- Limit how often a busy tunnel can requery the lighthouse. The new config
+  option `timers.requery_wait_duration` defaults to `60s`. (#940)
+
+- The internal structures for hostmaps were refactored to reduce memory usage
+  and the potential for subtle bugs. (#843, #938, #953, #954, #955)
+
+- Lots of dependency updates.
+
+### Fixed
+
+- Windows: Retry wintun device creation if it fails the first time. (#985)
+
+- Fix issues with firewall reject packets that could cause panics. (#957)
+
+- Fix relay migration during re-handshakes. (#964)
+
+- Various other refactors and fixes. (#935, #952, #972, #961, #996, #1002,
+  #987, #1004, #1030, #1032, ...)
+
 ## [1.7.2] - 2023-06-01
 
 ### Fixed
@@ -488,7 +664,15 @@ created.)
 
 - Initial public release.
 
-[Unreleased]: https://github.com/slackhq/nebula/compare/v1.7.2...HEAD
+[Unreleased]: https://github.com/slackhq/nebula/compare/v1.9.4...HEAD
+[1.9.4]: https://github.com/slackhq/nebula/releases/tag/v1.9.4
+[1.9.3]: https://github.com/slackhq/nebula/releases/tag/v1.9.3
+[1.9.2]: https://github.com/slackhq/nebula/releases/tag/v1.9.2
+[1.9.1]: https://github.com/slackhq/nebula/releases/tag/v1.9.1
+[1.9.0]: https://github.com/slackhq/nebula/releases/tag/v1.9.0
+[1.8.2]: https://github.com/slackhq/nebula/releases/tag/v1.8.2
+[1.8.1]: https://github.com/slackhq/nebula/releases/tag/v1.8.1
+[1.8.0]: https://github.com/slackhq/nebula/releases/tag/v1.8.0
 [1.7.2]: https://github.com/slackhq/nebula/releases/tag/v1.7.2
 [1.7.1]: https://github.com/slackhq/nebula/releases/tag/v1.7.1
 [1.7.0]: https://github.com/slackhq/nebula/releases/tag/v1.7.0

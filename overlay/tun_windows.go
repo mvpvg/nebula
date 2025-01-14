@@ -5,20 +5,21 @@ package overlay
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
 	"syscall"
 
 	"github.com/sirupsen/logrus"
+	"github.com/slackhq/nebula/config"
 )
 
-func newTunFromFd(_ *logrus.Logger, _ int, _ *net.IPNet, _ int, _ []Route, _ int, _ bool) (Device, error) {
+func newTunFromFd(_ *config.C, _ *logrus.Logger, _ int, _ netip.Prefix) (Device, error) {
 	return nil, fmt.Errorf("newTunFromFd not supported in Windows")
 }
 
-func newTun(l *logrus.Logger, deviceName string, cidr *net.IPNet, defaultMTU int, routes []Route, _ int, _ bool, _ bool) (Device, error) {
+func newTun(c *config.C, l *logrus.Logger, cidr netip.Prefix, multiqueue bool) (Device, error) {
 	useWintun := true
 	if err := checkWinTunExists(); err != nil {
 		l.WithError(err).Warn("Check Wintun driver failed, fallback to wintap driver")
@@ -26,14 +27,14 @@ func newTun(l *logrus.Logger, deviceName string, cidr *net.IPNet, defaultMTU int
 	}
 
 	if useWintun {
-		device, err := newWinTun(l, deviceName, cidr, defaultMTU, routes)
+		device, err := newWinTun(c, l, cidr, multiqueue)
 		if err != nil {
 			return nil, fmt.Errorf("create Wintun interface failed, %w", err)
 		}
 		return device, nil
 	}
 
-	device, err := newWaterTun(l, cidr, defaultMTU, routes)
+	device, err := newWaterTun(c, l, cidr, multiqueue)
 	if err != nil {
 		return nil, fmt.Errorf("create wintap driver failed, %w", err)
 	}

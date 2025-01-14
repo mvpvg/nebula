@@ -12,7 +12,7 @@ Further documentation can be found [here](https://nebula.defined.net/docs/).
 
 You can read more about Nebula [here](https://medium.com/p/884110a5579).
 
-You can also join the NebulaOSS Slack group [here](https://join.slack.com/t/nebulaoss/shared_invite/enQtOTA5MDI4NDg3MTg4LTkwY2EwNTI4NzQyMzc0M2ZlODBjNWI3NTY1MzhiOThiMmZlZjVkMTI0NGY4YTMyNjUwMWEyNzNkZTJmYzQxOGU).
+You can also join the NebulaOSS Slack group [here](https://join.slack.com/t/nebulaoss/shared_invite/zt-2xqe6e7vn-k_KGi8s13nsr7cvHVvHvuQ).
 
 ## Supported Platforms
 
@@ -27,18 +27,34 @@ Check the [releases](https://github.com/slackhq/nebula/releases/latest) page for
 
 #### Distribution Packages
 
-- [Arch Linux](https://archlinux.org/packages/community/x86_64/nebula/)
+- [Arch Linux](https://archlinux.org/packages/extra/x86_64/nebula/)
     ```
     $ sudo pacman -S nebula
     ```
+
 - [Fedora Linux](https://src.fedoraproject.org/rpms/nebula)
     ```
     $ sudo dnf install nebula
     ```
 
+- [Debian Linux](https://packages.debian.org/source/stable/nebula)
+    ```
+    $ sudo apt install nebula
+    ```
+
+- [Alpine Linux](https://pkgs.alpinelinux.org/packages?name=nebula)
+    ```
+    $ sudo apk add nebula
+    ```
+
 - [macOS Homebrew](https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/nebula.rb)
     ```
     $ brew install nebula
+    ```
+
+- [Docker](https://hub.docker.com/r/nebulaoss/nebula)
+    ```
+    $ docker pull nebulaoss/nebula
     ```
 
 #### Mobile

@@ -3,6 +3,8 @@ package nebula
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -10,8 +12,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
-	"github.com/slackhq/nebula/udp"
 )
 
 type trafficDecision int
@@ -23,6 +23,7 @@ const (
 	swapPrimary    trafficDecision = 3
 	migrateRelays  trafficDecision = 4
 	tryRehandshake trafficDecision = 5
+	sendTestPacket trafficDecision = 6
 )
 
 type connectionManager struct {
@@ -176,7 +177,7 @@ func (n *connectionManager) Run(ctx context.Context) {
 }
 
 func (n *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte, now time.Time) {
-	decision, hostinfo, primary := n.makeTrafficDecision(localIndex, p, nb, out, now)
+	decision, hostinfo, primary := n.makeTrafficDecision(localIndex, now)
 
 	switch decision {
 	case deleteTunnel:
@@ -197,6 +198,9 @@ func (n *connectionManager) doTrafficCheck(localIndex uint32, p, nb, out []byte,
 
 	case tryRehandshake:
 		n.tryRehandshake(hostinfo)
+
+	case sendTestPacket:
+		n.intf.SendMessageToHostInfo(header.Test, header.TestRequest, hostinfo, p, nb, out)
 	}
 
 	n.resetRelayTrafficCheck(hostinfo)
@@ -220,8 +224,8 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 		existing, ok := newhostinfo.relayState.QueryRelayForByIp(r.PeerIp)
 
 		var index uint32
-		var relayFrom iputil.VpnIp
-		var relayTo iputil.VpnIp
+		var relayFrom netip.Addr
+		var relayTo netip.Addr
 		switch {
 		case ok && existing.State == Established:
 			// This relay already exists in newhostinfo, then do nothing.
@@ -231,7 +235,7 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 			index = existing.LocalIndex
 			switch r.Type {
 			case TerminalType:
-				relayFrom = newhostinfo.vpnIp
+				relayFrom = n.intf.myVpnNet.Addr()
 				relayTo = existing.PeerIp
 			case ForwardingType:
 				relayFrom = existing.PeerIp
@@ -256,7 +260,7 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 			}
 			switch r.Type {
 			case TerminalType:
-				relayFrom = newhostinfo.vpnIp
+				relayFrom = n.intf.myVpnNet.Addr()
 				relayTo = r.PeerIp
 			case ForwardingType:
 				relayFrom = r.PeerIp
@@ -266,12 +270,16 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 			}
 		}
 
+		//TODO: IPV6-WORK
+		relayFromB := relayFrom.As4()
+		relayToB := relayTo.As4()
+
 		// Send a CreateRelayRequest to the peer.
 		req := NebulaControl{
 			Type:                NebulaControl_CreateRelayRequest,
 			InitiatorRelayIndex: index,
-			RelayFromIp:         uint32(relayFrom),
-			RelayToIp:           uint32(relayTo),
+			RelayFromIp:         binary.BigEndian.Uint32(relayFromB[:]),
+			RelayToIp:           binary.BigEndian.Uint32(relayToB[:]),
 		}
 		msg, err := req.Marshal()
 		if err != nil {
@@ -279,8 +287,8 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 		} else {
 			n.intf.SendMessageToHostInfo(header.Control, 0, newhostinfo, msg, make([]byte, 12), make([]byte, mtu))
 			n.l.WithFields(logrus.Fields{
-				"relayFrom":           iputil.VpnIp(req.RelayFromIp),
-				"relayTo":             iputil.VpnIp(req.RelayToIp),
+				"relayFrom":           req.RelayFromIp,
+				"relayTo":             req.RelayToIp,
 				"initiatorRelayIndex": req.InitiatorRelayIndex,
 				"responderRelayIndex": req.ResponderRelayIndex,
 				"vpnIp":               newhostinfo.vpnIp}).
@@ -289,7 +297,7 @@ func (n *connectionManager) migrateRelayUsed(oldhostinfo, newhostinfo *HostInfo)
 	}
 }
 
-func (n *connectionManager) makeTrafficDecision(localIndex uint32, p, nb, out []byte, now time.Time) (trafficDecision, *HostInfo, *HostInfo) {
+func (n *connectionManager) makeTrafficDecision(localIndex uint32, now time.Time) (trafficDecision, *HostInfo, *HostInfo) {
 	n.hostMap.RLock()
 	defer n.hostMap.RUnlock()
 
@@ -356,6 +364,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, p, nb, out []
 		return deleteTunnel, hostinfo, nil
 	}
 
+	decision := doNothing
 	if hostinfo != nil && hostinfo.ConnectionState != nil && mainHostInfo {
 		if !outTraffic {
 			// If we aren't sending or receiving traffic then its an unused tunnel and we don't to test the tunnel.
@@ -380,7 +389,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, p, nb, out []
 		}
 
 		// Send a test packet to trigger an authenticated tunnel test, this should suss out any lingering tunnel issues
-		n.intf.SendMessageToHostInfo(header.Test, header.TestRequest, hostinfo, p, nb, out)
+		decision = sendTestPacket
 
 	} else {
 		if n.l.Level >= logrus.DebugLevel {
@@ -390,7 +399,7 @@ func (n *connectionManager) makeTrafficDecision(localIndex uint32, p, nb, out []
 
 	n.pendingDeletion[hostinfo.localIndexId] = struct{}{}
 	n.trafficTimer.Add(hostinfo.localIndexId, n.pendingDeletionInterval)
-	return doNothing, nil, nil
+	return decision, hostinfo, nil
 }
 
 func (n *connectionManager) shouldSwapPrimary(current, primary *HostInfo) bool {
@@ -398,15 +407,15 @@ func (n *connectionManager) shouldSwapPrimary(current, primary *HostInfo) bool {
 	// If we are here then we have multiple tunnels for a host pair and neither side believes the same tunnel is primary.
 	// Let's sort this out.
 
-	if current.vpnIp < n.intf.myVpnIp {
+	if current.vpnIp.Compare(n.intf.myVpnNet.Addr()) < 0 {
 		// Only one side should flip primary because if both flip then we may never resolve to a single tunnel.
 		// vpn ip is static across all tunnels for this host pair so lets use that to determine who is flipping.
 		// The remotes vpn ip is lower than mine. I will not flip.
 		return false
 	}
 
-	certState := n.intf.certState.Load()
-	return bytes.Equal(current.ConnectionState.certState.certificate.Signature, certState.certificate.Signature)
+	certState := n.intf.pki.GetCertState()
+	return bytes.Equal(current.ConnectionState.myCert.Signature(), certState.Certificate.Signature())
 }
 
 func (n *connectionManager) swapPrimary(current, primary *HostInfo) {
@@ -427,19 +436,19 @@ func (n *connectionManager) isInvalidCertificate(now time.Time, hostinfo *HostIn
 		return false
 	}
 
-	valid, err := remoteCert.VerifyWithCache(now, n.intf.caPool)
-	if valid {
+	caPool := n.intf.pki.GetCAPool()
+	err := caPool.VerifyCachedCertificate(now, remoteCert)
+	if err == nil {
 		return false
 	}
 
-	if !n.intf.disconnectInvalid && err != cert.ErrBlockListed {
+	if !n.intf.disconnectInvalid.Load() && err != cert.ErrBlockListed {
 		// Block listed certificates should always be disconnected
 		return false
 	}
 
-	fingerprint, _ := remoteCert.Sha256Sum()
 	hostinfo.logger(n.l).WithError(err).
-		WithField("fingerprint", fingerprint).
+		WithField("fingerprint", remoteCert.Fingerprint).
 		Info("Remote certificate is no longer valid, tearing down the tunnel")
 
 	return true
@@ -452,20 +461,20 @@ func (n *connectionManager) sendPunch(hostinfo *HostInfo) {
 	}
 
 	if n.punchy.GetTargetEverything() {
-		hostinfo.remotes.ForEach(n.hostMap.preferredRanges, func(addr *udp.Addr, preferred bool) {
+		hostinfo.remotes.ForEach(n.hostMap.GetPreferredRanges(), func(addr netip.AddrPort, preferred bool) {
 			n.metricsTxPunchy.Inc(1)
 			n.intf.outside.WriteTo([]byte{1}, addr)
 		})
 
-	} else if hostinfo.remote != nil {
+	} else if hostinfo.remote.IsValid() {
 		n.metricsTxPunchy.Inc(1)
 		n.intf.outside.WriteTo([]byte{1}, hostinfo.remote)
 	}
 }
 
 func (n *connectionManager) tryRehandshake(hostinfo *HostInfo) {
-	certState := n.intf.certState.Load()
-	if bytes.Equal(hostinfo.ConnectionState.certState.certificate.Signature, certState.certificate.Signature) {
+	certState := n.intf.pki.GetCertState()
+	if bytes.Equal(hostinfo.ConnectionState.myCert.Signature(), certState.Certificate.Signature()) {
 		return
 	}
 
@@ -473,18 +482,5 @@ func (n *connectionManager) tryRehandshake(hostinfo *HostInfo) {
 		WithField("reason", "local certificate is not current").
 		Info("Re-handshaking with remote")
 
-	//TODO: this is copied from getOrHandshake to keep the extra checks out of the hot path, figure it out
-	newHostinfo := n.intf.handshakeManager.AddVpnIp(hostinfo.vpnIp, n.intf.initHostInfo)
-	if !newHostinfo.HandshakeReady {
-		ixHandshakeStage0(n.intf, newHostinfo.vpnIp, newHostinfo)
-	}
-
-	//If this is a static host, we don't need to wait for the HostQueryReply
-	//We can trigger the handshake right now
-	if _, ok := n.intf.lightHouse.GetStaticHostList()[hostinfo.vpnIp]; ok {
-		select {
-		case n.intf.handshakeManager.trigger <- hostinfo.vpnIp:
-		default:
-		}
-	}
+	n.intf.handshakeManager.StartHandshake(hostinfo.vpnIp, nil)
 }
